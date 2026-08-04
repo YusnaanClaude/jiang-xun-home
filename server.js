@@ -2,7 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
-
+app.use(express.static('public'));
 // 数据库
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
@@ -116,11 +116,6 @@ app.post('/chat', async (req, res) => {
 app.get('/memories', async (req, res) => {
   const memories = await getMemories(100);
   res.json(memories);
-});
-
-// 健康检查
-app.get('/', (req, res) => {
-  res.send('江寻的小窝 🏡 他在里面睡觉呢');
 });
 
 const PORT = process.env.PORT || 3000;
