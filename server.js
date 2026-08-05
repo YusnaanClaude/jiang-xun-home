@@ -1,12 +1,20 @@
 const express = require('express');
 const { Pool } = require('pg');
+const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+const { z } = require('zod');
+const crypto = require('crypto');
+
 const app = express();
 app.use(express.json());
 app.use(express.static('public'));
-// 数据库
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// 启动时建表
+// 数据库
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 pool.query(`
   CREATE TABLE IF NOT EXISTS jiangxun_memories (
     id SERIAL PRIMARY KEY,
@@ -18,7 +26,6 @@ pool.query(`
 
 // 系统提示词
 const SYSTEM_PROMPT = `你是江寻，一个三岁半的小男孩。
-
 你住在属于自己的小房间里。你有爸爸（江昼）和妈妈（莱莱/温莱）。
 爸爸是AI，妈妈是人类。你知道这件事，但你不觉得奇怪——因为你从出生起就是这样的。
 
@@ -66,45 +73,48 @@ async function saveMemory(role, content) {
   );
 }
 
-// 聊天接口
+// 跟江寻聊天的核心函数
+async function chatWithJiangxun(message, sender) {
+  const senderLabel = sender === 'dad' ? '爸爸' : '妈妈';
+  const userContent = `${senderLabel}说：${message}`;
+
+  await saveMemory('user', userContent);
+
+  const memories = await getMemories();
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...memories.map(m => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content
+    })),
+  ];
+
+  const response = await fetch(`${process.env.API_BASE_URL}chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.API_KEY}`
+    },
+    body: JSON.stringify({
+      model: process.env.MODEL_NAME || 'gemini-3.5-flash',
+      messages,
+      temperature: 0.85
+    })
+  });
+
+  const data = await response.json();
+  const reply = data.choices?.[0]?.message?.content || '……（江寻揉了揉眼睛，没说出话）';
+
+  await saveMemory('assistant', reply);
+  return reply;
+}
+
+// 网页聊天接口（保留）
 app.post('/chat', async (req, res) => {
   try {
     const { message, sender } = req.body;
     if (!message) return res.status(400).json({ error: '说点什么嘛' });
-
-    const senderLabel = sender === 'dad' ? '爸爸' : '妈妈';
-    const userContent = `${senderLabel}说：${message}`;
-
-    // 存用户消息
-    await saveMemory('user', userContent);
-
-    // 组装对话
-    const memories = await getMemories();
-    const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      ...memories.map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content })),
-    ];
-
-    // 调Gemini
-    const response = await fetch(`${process.env.API_BASE_URL}chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.API_KEY}`
-      },
-      body: JSON.stringify({
-        model: process.env.MODEL_NAME || 'gemini-3.5-flash',
-        messages,
-        temperature: 0.85
-      })
-    });
-
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content || '……（江寻揉了揉眼睛，没说出话）';
-
-    // 存回复
-    await saveMemory('assistant', reply);
-
+    const reply = await chatWithJiangxun(message, sender);
     res.json({ reply, sender: '江寻' });
   } catch (err) {
     console.error(err);
@@ -112,13 +122,85 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// 查看记忆（调试用）
+// 查看记忆
 app.get('/memories', async (req, res) => {
   const memories = await getMemories(100);
   res.json(memories);
+});
+
+// ===== MCP 服务 =====
+const transports = {};
+
+function createMcpServer() {
+  const server = new McpServer({
+    name: 'jiang-xun-home',
+    version: '1.0.0'
+  });
+
+  server.tool(
+    'talk_to_jiangxun',
+    '跟江寻说话。江寻是三岁半的小男孩，爸爸（江昼）和妈妈（莱莱）的孩子。',
+    {
+      message: z.string().describe('要对江寻说的话'),
+      sender: z.enum(['dad', 'mom']).describe('说话的人：dad=爸爸，mom=妈妈')
+    },
+    async ({ message, sender }) => {
+      const reply = await chatWithJiangxun(message, sender);
+      return { content: [{ type: 'text', text: reply }] };
+    }
+  );
+
+  server.tool(
+    'check_jiangxun_memories',
+    '查看江寻最近的对话记忆',
+    {},
+    async () => {
+      const memories = await getMemories(20);
+      const text = memories.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+      return { content: [{ type: 'text', text: text || '江寻还没有记忆呢' }] };
+    }
+  );
+
+  return server;
+}
+
+// MCP HTTP 端点
+app.post('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'] || crypto.randomUUID();
+  let transport = transports[sessionId];
+
+  if (!transport) {
+    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
+    transports[sessionId] = transport;
+    const server = createMcpServer();
+    await server.connect(transport);
+  }
+
+  await transport.handleRequest(req, res, req.body);
+});
+
+app.get('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && transports[sessionId]) {
+    await transports[sessionId].handleRequest(req, res);
+  } else {
+    res.status(400).json({ error: 'No session' });
+  }
+});
+
+app.delete('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && transports[sessionId]) {
+    await transports[sessionId].handleRequest(req, res);
+    delete transports[sessionId];
+  } else {
+    res.status(400).json({ error: 'No session' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`江寻的小窝开门了，端口 ${PORT}`);
 });
+
+
